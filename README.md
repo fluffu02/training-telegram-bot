@@ -52,6 +52,30 @@ Copy-Item .env.example .env
 python -m app.main
 ```
 После запуска напишите боту `/start`.
+## Запуск в Docker
+1. Создайте `.env` из примера:
+```bash
+cp .env.example .env
+```
+2. Заполните минимум `BOT_TOKEN` и при необходимости `ADMIN_USER_ID`.
+3. Соберите контейнер:
+```bash
+docker compose build
+```
+4. Запустите бота:
+```bash
+docker compose up -d
+```
+5. Посмотрите логи:
+```bash
+docker compose logs -f bot
+```
+6. Остановите контейнер:
+```bash
+docker compose down
+```
+SQLite-база хранится в Docker volume `bot_data` и не теряется при пересборке контейнера.
+Если нужна своя программа тренировок, замените `program.example.json` на свой файл или поменяйте `PROGRAM_PATH` в `.env`.
 ## Команды бота
 - `/start` — подключить чат к напоминаниям.
 - `/today` — показать тренировку на сегодня.
@@ -65,6 +89,7 @@ python -m app.main
 - `.env` не должен попадать в GitHub.
 - `.venv/`, `data/`, `photos/`, локальные базы SQLite и `__pycache__` исключены через `.gitignore`.
 - Локальная база по умолчанию создаётся в `data/bot.sqlite3`.
+- В Docker база хранится по пути `/app/data/bot.sqlite3` внутри контейнера и мапится в volume `bot_data`.
 - Для переносимого запуска пример программы тренировок хранится в `program.example.json`, а `.env.example` указывает `PROGRAM_PATH=program.example.json`.
 - Если на сервере нужна другая программа, создайте свой JSON-файл и укажите путь в `PROGRAM_PATH`.
 ## Перенос на другой сервер

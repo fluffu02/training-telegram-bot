@@ -1,0 +1,15 @@
+services:
+  bot:
+    build:
+      context: .
+    container_name: training-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - bot_data:/app/data
+      - ./program.example.json:/app/program.example.json:ro
+
+volumes:
+  bot_data:

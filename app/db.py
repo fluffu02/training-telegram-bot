@@ -71,6 +71,15 @@ class Database:
                     success INTEGER NOT NULL DEFAULT 1,
                     error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE,
+                    username TEXT,
+                    first_name TEXT,
+                    banned_at TEXT NOT NULL,
+                    banned_by INTEGER,
+                    reason TEXT
+                );
 
                 CREATE INDEX IF NOT EXISTS idx_bot_request_logs_timestamp
                 ON bot_request_logs(timestamp);
@@ -86,6 +95,8 @@ class Database:
             await self._ensure_column(db, "users", "total_cost", "REAL NOT NULL DEFAULT 0")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_banned_users_telegram_id ON banned_users(telegram_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_banned_users_username ON banned_users(username)")
             await self._ensure_column(db, "weekly_logs", "weight_date", "TEXT")
             await self._ensure_column(db, "weekly_logs", "photo_date", "TEXT")
             await self._ensure_column(db, "bot_request_logs", "is_ai_request", "INTEGER NOT NULL DEFAULT 0")
@@ -297,7 +308,37 @@ class Database:
         cursor = await db.execute(query, parameters)
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def search_users(self, query: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    async def count_users(self, query: str | None = None) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            if query:
+                normalized = query.strip()
+                username = normalized[1:] if normalized.startswith("@") else normalized
+                if normalized.isdigit():
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM users WHERE telegram_id = ? OR chat_id = ?",
+                        (int(normalized), int(normalized)),
+                    )
+                    row = await cursor.fetchone()
+                    return int(row[0])
+
+                pattern = f"%{username}%"
+                cursor = await db.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE LOWER(COALESCE(first_name, '')) LIKE LOWER(?)
+                       OR LOWER(COALESCE(username, '')) LIKE LOWER(?)
+                    """,
+                    (pattern, pattern),
+                )
+                row = await cursor.fetchone()
+                return int(row[0])
+
+            cursor = await db.execute("SELECT COUNT(*) FROM users")
+            row = await cursor.fetchone()
+            return int(row[0])
+
+    async def search_users(self, query: str | None = None, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             if query:
@@ -311,9 +352,9 @@ class Database:
                         FROM users
                         WHERE telegram_id = ? OR chat_id = ?
                         ORDER BY COALESCE(last_seen, created_at) DESC
-                        LIMIT ?
+                        LIMIT ? OFFSET ?
                         """,
-                        (int(normalized), int(normalized), limit),
+                        (int(normalized), int(normalized), limit, offset),
                     )
 
                 pattern = f"%{username}%"
@@ -325,9 +366,9 @@ class Database:
                     WHERE LOWER(COALESCE(first_name, '')) LIKE LOWER(?)
                        OR LOWER(COALESCE(username, '')) LIKE LOWER(?)
                     ORDER BY COALESCE(last_seen, created_at) DESC
-                    LIMIT ?
+                    LIMIT ? OFFSET ?
                     """,
-                    (pattern, pattern, limit),
+                    (pattern, pattern, limit, offset),
                 )
 
             return await self._fetch_users(
@@ -336,14 +377,180 @@ class Database:
                 SELECT *
                 FROM users
                 ORDER BY COALESCE(last_seen, created_at) DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             )
+    async def resolve_user(self, identifier: str) -> dict[str, Any] | None:
+        normalized = identifier.strip()
+        username = normalized[1:] if normalized.startswith("@") else normalized
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if normalized.isdigit():
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE telegram_id = ? OR chat_id = ?
+                    LIMIT 1
+                    """,
+                    (int(normalized), int(normalized)),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE LOWER(username) = LOWER(?)
+                    LIMIT 1
+                    """,
+                    (username,),
+                )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def is_banned(self, telegram_id: int | None, username: str | None = None) -> dict[str, Any] | None:
+        if telegram_id is None and not username:
+            return None
+
+        normalized_username = username[1:] if username and username.startswith("@") else username
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM banned_users
+                WHERE (? IS NOT NULL AND telegram_id = ?)
+                   OR (? IS NOT NULL AND username IS NOT NULL AND LOWER(username) = LOWER(?))
+                LIMIT 1
+                """,
+                (telegram_id, telegram_id, normalized_username, normalized_username),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def ban_user(
+        self,
+        identifier: str,
+        banned_by: int | None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = identifier.strip()
+        username_argument = normalized[1:] if normalized.startswith("@") else None
+        found_user = await self.resolve_user(normalized)
+
+        telegram_id = None
+        username = username_argument
+        first_name = None
+        if found_user:
+            telegram_id = found_user.get("telegram_id") or found_user.get("chat_id")
+            username = found_user.get("username") or username
+            first_name = found_user.get("first_name")
+        elif normalized.isdigit():
+            telegram_id = int(normalized)
+        elif not username:
+            username = normalized
+
+        now = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            if telegram_id is not None:
+                if username:
+                    await db.execute(
+                        "DELETE FROM banned_users WHERE telegram_id IS NULL AND LOWER(username) = LOWER(?)",
+                        (username,),
+                    )
+                await db.execute(
+                    """
+                    INSERT INTO banned_users(telegram_id, username, first_name, banned_at, banned_by, reason)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(telegram_id) DO UPDATE SET
+                        username = COALESCE(excluded.username, banned_users.username),
+                        first_name = COALESCE(excluded.first_name, banned_users.first_name),
+                        banned_at = excluded.banned_at,
+                        banned_by = excluded.banned_by,
+                        reason = excluded.reason
+                    """,
+                    (telegram_id, username, first_name, now, banned_by, reason),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM banned_users WHERE LOWER(username) = LOWER(?)",
+                    (username,),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO banned_users(telegram_id, username, first_name, banned_at, banned_by, reason)
+                    VALUES(NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (username, first_name, now, banned_by, reason),
+                )
+            await db.commit()
+
+        return {
+            "telegram_id": telegram_id,
+            "username": username,
+            "first_name": first_name,
+            "banned_at": now,
+            "banned_by": banned_by,
+            "reason": reason,
+        }
+
+    async def unban_user(self, identifier: str) -> bool:
+        normalized = identifier.strip()
+        username = normalized[1:] if normalized.startswith("@") else normalized
+        found_user = await self.resolve_user(normalized)
+        telegram_id = found_user.get("telegram_id") or found_user.get("chat_id") if found_user else None
+
+        async with aiosqlite.connect(self.path) as db:
+            if normalized.isdigit():
+                cursor = await db.execute(
+                    """
+                    DELETE FROM banned_users
+                    WHERE telegram_id = ?
+                       OR (? IS NOT NULL AND telegram_id = ?)
+                    """,
+                    (int(normalized), telegram_id, telegram_id),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    DELETE FROM banned_users
+                    WHERE LOWER(username) = LOWER(?)
+                       OR (? IS NOT NULL AND telegram_id = ?)
+                    """,
+                    (username, telegram_id, telegram_id),
+                )
+            await db.commit()
+        return cursor.rowcount > 0
+
+    async def list_banned_users(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM banned_users
+                ORDER BY banned_at DESC
+                """
+            )
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
     async def list_chat_ids(self) -> list[int]:
         async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute("SELECT chat_id FROM users")
+            cursor = await db.execute(
+                """
+                SELECT u.chat_id
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM banned_users b
+                    WHERE (b.telegram_id IS NOT NULL AND (b.telegram_id = u.telegram_id OR b.telegram_id = u.chat_id))
+                       OR (b.username IS NOT NULL AND u.username IS NOT NULL AND LOWER(b.username) = LOWER(u.username))
+                )
+                """
+            )
             rows = await cursor.fetchall()
         return [int(row[0]) for row in rows]
 

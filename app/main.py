@@ -1,12 +1,15 @@
 import asyncio
 from datetime import date, datetime, timedelta, timezone as utc_timezone
 import logging
+import os
+import sys
 from time import perf_counter
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, CallbackQuery, Message
+from aiogram.types import BotCommand, CallbackQuery, Message, TelegramObject
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -88,6 +91,18 @@ def format_db_datetime(value: str | None, include_time: bool = True) -> str:
     return parsed.strftime("%d.%m.%Y")
 
 
+def format_compact_datetime(value: str | None) -> str:
+    if not value:
+        return "—"
+
+    try:
+        parsed = datetime.fromisoformat(value).replace(tzinfo=utc_timezone.utc).astimezone(timezone)
+    except ValueError:
+        return value
+
+    return parsed.strftime("%d.%m %H:%M")
+
+
 def user_display_name(user: dict) -> str:
     return user.get("first_name") or "—"
 
@@ -114,6 +129,31 @@ def render_user_details(users: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+def render_compact_users(users: list[dict], start_index: int = 1) -> str:
+    if not users:
+        return "Нет данных."
+
+    blocks = []
+    for index, user in enumerate(users, start=start_index):
+        name = user_display_name(user)
+        username = user.get("username")
+        title = f"👤 {index}. {name}"
+        if username:
+            title += f" (@{username})"
+
+        messages_count = int(user.get("messages_count") or 0)
+        messages_line = "Новый пользователь" if messages_count == 0 else f"Сообщений: {messages_count}"
+        telegram_id = user.get("telegram_id") or "скрыт"
+        last_seen = format_compact_datetime(user.get("last_seen") or user.get("created_at"))
+        blocks.append(
+            f"{title}\n"
+            f"ID: {telegram_id}\n"
+            f"{messages_line}\n"
+            f"Последняя активность: {last_seen}"
+        )
+    return "\n\n".join(blocks)
+
+
 def render_top_users(title: str, users: list[dict], metric: str, suffix: str = "") -> str:
     if not users:
         return f"{title}\n• нет данных"
@@ -123,6 +163,76 @@ def render_top_users(title: str, users: list[dict], metric: str, suffix: str = "
         value = user.get(metric) or 0
         lines.append(f"• {user_display_name(user)} ({user_username(user)}, ID {user.get('telegram_id') or '—'}) — {value}{suffix}")
     return "\n".join(lines)
+
+def render_banned_users(users: list[dict]) -> str:
+    if not users:
+        return "Заблокированных пользователей нет."
+
+    blocks = []
+    for user in users:
+        username = f"@{user['username']}" if user.get("username") else "—"
+        reason = user.get("reason") or "—"
+        blocks.append(
+            f"• Имя: {user.get('first_name') or '—'}\n"
+            f"  Username: {username}\n"
+            f"  Telegram ID: {user.get('telegram_id') or '—'}\n"
+            f"  Дата блокировки: {format_db_datetime(user.get('banned_at'))}\n"
+            f"  Причина: {reason}"
+        )
+    return "\n\n".join(blocks)
+
+
+def render_help_text(user_id: int | None) -> str:
+    help_text = (
+        "Команды бота:\n\n"
+        "/today — показать тренировку на сегодня\n"
+        "/week — показать все тренировки на неделю\n"
+        "/weight — твой вес\n"
+        "/progress — показать историю веса и фото\n"
+        "/help — показать этот список команд\n\n"
+        "Фото без команды — автоматически сохранить как фото формы за текущую неделю.\n"
+        "Кнопка ✅ Выполнено под тренировкой отмечает тренировку выполненной."
+    )
+
+    if user_id == settings.admin_user_id:
+        help_text += (
+            "\n\n"
+            "Админ-команды:\n\n"
+            "/stats\n"
+            "/users\n"
+            "/ban\n"
+            "/unban\n"
+            "/banned\n"
+            "/broadcast\n"
+            "/restart"
+        )
+
+    return help_text
+
+class BannedUsersMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user or user.id == settings.admin_user_id:
+            return await handler(event, data)
+
+        banned = await db.is_banned(user.id, user.username)
+        if not banned:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            sent = await event.answer("Доступ к боту ограничен.")
+            await remember_outgoing(sent)
+        elif isinstance(event, CallbackQuery):
+            await event.answer("Доступ к боту ограничен.", show_alert=True)
+            if event.message:
+                sent = await event.message.answer("Доступ к боту ограничен.")
+                await remember_outgoing(sent)
+        return None
 
 
 async def remember_incoming(message: Message) -> None:
@@ -206,9 +316,15 @@ async def broadcast_weekly() -> None:
 async def broadcast_afternoon() -> None:
     for chat_id in await db.list_chat_ids():
         try:
-            await send_text_reminder(chat_id, "Ничего не забыл?)")
+            await send_text_reminder(
+                chat_id,
+                "Не забыл сегодня потренить? 👀\n\n"
+                "Команды:\n"
+                "/today — тренировка на сегодня\n"
+                "/week — вся неделя"
+            )
         except Exception:
-            logging.exception("Failed to send afternoon reminder to chat_id=%s", chat_id)
+            logging.exception("Failed to send second reminder to chat_id=%s", chat_id)
 
 
 async def broadcast_sleep() -> None:
@@ -226,6 +342,18 @@ async def broadcast_clear() -> None:
             await clear_known_chat_messages(chat_id, settings.clear_limit)
         except Exception:
             logging.exception("Failed to clear chat_id=%s", chat_id)
+
+
+async def send_help_after_restart() -> None:
+    chat_id = os.environ.pop("TRAINING_BOT_SHOW_HELP_CHAT_ID", None)
+    if not chat_id:
+        return
+
+    try:
+        sent = await bot.send_message(int(chat_id), render_help_text(settings.admin_user_id))
+        await remember_outgoing(sent)
+    except Exception:
+        logging.exception("Failed to send help after restart to chat_id=%s", chat_id)
 
 
 @dp.message(Command("start"))
@@ -265,21 +393,8 @@ async def week(message: Message) -> None:
 async def help_command(message: Message) -> None:
     started_at = perf_counter()
     await remember_incoming(message)
-    await answer_and_remember(
-        message,
-        "Команды бота:\n\n"
-        "/start — подключить этот чат к напоминаниям\n"
-        "/today — показать тренировку на сегодня\n"
-        "/week — показать все тренировки на неделю\n"
-        "/weight — твой вес\n"
-        "/progress — показать историю веса и фото\n"
-        "/clear — очистить известные боту сообщения в чате\n"
-        "/help — показать этот список команд\n\n"
-        "Фото без команды — автоматически сохранить как фото формы за текущую неделю.\n"
-        "Кнопка ✅ Выполнено под тренировкой отмечает тренировку выполненной.\n\n"
-        "Важно: Telegram не даёт боту удалить вообще всю историю. Бот чистит известные ему сообщения, "
-        "которые Telegram разрешает удалить."
-    )
+    user_id = message.from_user.id if message.from_user else None
+    await answer_and_remember(message, render_help_text(user_id))
     await log_request(message, "help", started_at)
 
 
@@ -308,10 +423,7 @@ async def stats(message: Message) -> None:
     await answer_and_remember(
         message,
         f"• Всего пользователей: {stats_data['users_total']}\n"
-        f"• Всего сообщений: {stats_data['messages_total']}\n"
-        f"• Всего запросов к ИИ: {stats_data['total_ai_requests'] or 0}\n"
-        f"• Запросов сегодня: {stats_data['requests_today'] or 0}\n"
-        f"• Запросов за неделю: {stats_data['requests_week'] or 0}\n\n"
+        f"• Всего сообщений: {stats_data['messages_total']}\n\n"
         "Пользователи:\n\n"
         f"• Всего пользователей: {user_stats['users_total']}\n"
         f"• Новых сегодня: {user_stats['new_today']}\n"
@@ -321,11 +433,147 @@ async def stats(message: Message) -> None:
         "Последние пользователи:\n\n"
         f"{render_user_details(stats_data['latest_users'])}\n\n"
         "ТОП пользователей:\n\n"
-        f"{render_top_users('По количеству сообщений:', stats_data['top_messages'], 'messages_count')}\n\n"
-        f"{render_top_users('По количеству запросов к ИИ:', stats_data['top_ai'], 'requests_count')}\n\n"
-        f"{render_top_users('По количеству потраченных токенов:', stats_data['top_tokens'], 'tokens_used')}"
+        f"{render_top_users('По количеству сообщений:', stats_data['top_messages'], 'messages_count')}"
     )
     await log_request(message, "stats", started_at)
+
+@dp.message(Command("ban"))
+async def ban_command(message: Message) -> None:
+    started_at = perf_counter()
+    await remember_incoming(message)
+    user_id = message.from_user.id if message.from_user else None
+
+    if user_id != settings.admin_user_id:
+        await answer_and_remember(message, "Недостаточно прав.")
+        await log_request(message, "ban_denied", started_at)
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await answer_and_remember(message, "Использование: /ban <Telegram ID или @username> [причина]")
+        await log_request(message, "ban", started_at, success=False, error="missing_target")
+        return
+
+    target = parts[1].strip()
+    reason = parts[2].strip() if len(parts) > 2 else None
+    found_user = await db.resolve_user(target)
+    target_user_id = None
+    if target.isdigit():
+        target_user_id = int(target)
+    elif found_user:
+        target_user_id = found_user.get("telegram_id") or found_user.get("chat_id")
+
+    if target_user_id == settings.admin_user_id:
+        await answer_and_remember(message, "Недоступно.")
+        await log_request(message, "ban", started_at, success=False, error="self_ban")
+        return
+
+    await db.ban_user(target, user_id, reason)
+    await answer_and_remember(message, "Пользователь заблокирован.")
+    await log_request(message, "ban", started_at)
+
+
+@dp.message(Command("unban"))
+async def unban_command(message: Message) -> None:
+    started_at = perf_counter()
+    await remember_incoming(message)
+    user_id = message.from_user.id if message.from_user else None
+
+    if user_id != settings.admin_user_id:
+        await answer_and_remember(message, "Недостаточно прав.")
+        await log_request(message, "unban_denied", started_at)
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await answer_and_remember(message, "Использование: /unban <Telegram ID или @username>")
+        await log_request(message, "unban", started_at, success=False, error="missing_target")
+        return
+
+    await db.unban_user(parts[1].strip())
+    await answer_and_remember(message, "Пользователь разблокирован.")
+    await log_request(message, "unban", started_at)
+
+
+@dp.message(Command("banned"))
+async def banned_command(message: Message) -> None:
+    started_at = perf_counter()
+    await remember_incoming(message)
+    user_id = message.from_user.id if message.from_user else None
+
+    if user_id != settings.admin_user_id:
+        await answer_and_remember(message, "Недостаточно прав.")
+        await log_request(message, "banned_denied", started_at)
+        return
+
+    banned_users = await db.list_banned_users()
+    await answer_and_remember(message, f"Заблокированные пользователи:\n\n{render_banned_users(banned_users)}")
+    await log_request(message, "banned", started_at)
+
+async def restart_process() -> None:
+    await asyncio.sleep(1)
+    await bot.session.close()
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+@dp.message(Command("restart"))
+async def restart_command(message: Message) -> None:
+    started_at = perf_counter()
+    await remember_incoming(message)
+    user_id = message.from_user.id if message.from_user else None
+
+    if user_id != settings.admin_user_id:
+        await answer_and_remember(message, "Недостаточно прав.")
+        await log_request(message, "restart_denied", started_at)
+        return
+
+    await answer_and_remember(message, "Перезапускаю бота.")
+    await log_request(message, "restart", started_at)
+    os.environ["TRAINING_BOT_SHOW_HELP_CHAT_ID"] = str(message.chat.id)
+    asyncio.create_task(restart_process())
+
+@dp.message(Command("broadcast"))
+async def broadcast_command(message: Message) -> None:
+    started_at = perf_counter()
+    await remember_incoming(message)
+    user_id = message.from_user.id if message.from_user else None
+
+    if user_id != settings.admin_user_id:
+        await answer_and_remember(message, "Команда недоступна.")
+        await log_request(message, "broadcast_denied", started_at)
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await answer_and_remember(
+            message,
+            "Введите сообщение для рассылки.\n\n"
+            "Пример:\n"
+            "/broadcast Завтра выходной"
+        )
+        await log_request(message, "broadcast", started_at, success=False, error="missing_text")
+        return
+
+    announcement = f"📢 Объявление\n\n{parts[1].strip()}"
+    success_count = 0
+    error_count = 0
+
+    for chat_id in await db.list_chat_ids():
+        try:
+            sent = await bot.send_message(chat_id, announcement)
+            await remember_outgoing(sent)
+            success_count += 1
+        except Exception:
+            error_count += 1
+            logging.exception("Failed to broadcast message to chat_id=%s", chat_id)
+
+    await answer_and_remember(
+        message,
+        "Рассылка завершена.\n\n"
+        f"Успешно: {success_count}\n"
+        f"Ошибок: {error_count}"
+    )
+    await log_request(message, "broadcast", started_at)
 
 
 @dp.message(Command("users"))
@@ -339,11 +587,26 @@ async def users_command(message: Message) -> None:
         await log_request(message, "users_denied", started_at)
         return
 
+    page_size = 10
     parts = (message.text or "").split(maxsplit=1)
-    query = parts[1].strip() if len(parts) > 1 else None
-    users = await db.search_users(query, 10)
+    argument = parts[1].strip() if len(parts) > 1 else None
+    page = 1
+    query = argument
+    if argument and argument.isdigit() and len(argument) <= 3:
+        page = max(1, int(argument))
+        query = None
+
+    total_users = await db.count_users(query)
+    offset = (page - 1) * page_size
+    users = await db.search_users(query, page_size, offset)
+    shown_to = min(offset + len(users), total_users)
     title = "Пользователи" if not query else f"Пользователи по запросу: {query}"
-    await answer_and_remember(message, f"{title}\n\n{render_user_details(users)}")
+    await answer_and_remember(
+        message,
+        f"{title}\n"
+        f"Показано {shown_to} из {total_users} пользователей.\n\n"
+        f"{render_compact_users(users, offset + 1)}"
+    )
     await log_request(message, "users", started_at)
 
 
@@ -352,17 +615,10 @@ async def clear_chat(message: Message) -> None:
     started_at = perf_counter()
     await remember_incoming(message)
     deleted = await clear_known_chat_messages(message.chat.id, settings.clear_limit)
-
-    if deleted == 0:
-        notice = await answer_and_remember(
-            message,
-            "Не смог удалить сообщения. В группах боту нужны права администратора на удаление сообщений."
-        )
-        await asyncio.sleep(5)
-        try:
-            await bot.delete_message(message.chat.id, notice.message_id)
-        except Exception:
-            pass
+    await answer_and_remember(
+        message,
+        "История почищена. Продолжаем тренироваться зайчик."
+    )
     await log_request(message, "clear", started_at)
 
 
@@ -517,6 +773,8 @@ async def weekly_photo_help(callback: CallbackQuery) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await db.init()
+    dp.message.middleware(BannedUsersMiddleware())
+    dp.callback_query.middleware(BannedUsersMiddleware())
     await bot.set_my_commands(
         [
             BotCommand(command="help", description="Список команд"),
@@ -550,7 +808,7 @@ async def main() -> None:
     scheduler.add_job(
         broadcast_afternoon,
         CronTrigger(hour=afternoon_hour, minute=afternoon_minute, timezone=settings.timezone),
-        id="afternoon_reminder",
+        id="second_reminder",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -566,6 +824,14 @@ async def main() -> None:
         replace_existing=True,
     )
     scheduler.start()
+    logging.info("Scheduled daily reminder 10:00: %s", settings.daily_reminder_time)
+    logging.info("Scheduled second reminder 15:00: %s", settings.afternoon_reminder_time)
+    logging.info(
+        "Scheduled weekly check-in: %s %s",
+        settings.weekly_reminder_day,
+        settings.weekly_reminder_time,
+    )
+    await send_help_after_restart()
 
     await dp.start_polling(bot)
 
